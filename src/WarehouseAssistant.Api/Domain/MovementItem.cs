@@ -12,5 +12,5 @@ public sealed class MovementItem
     public int NomenclatureId { get; set; }
     public Nomenclature Nomenclature { get; set; } = null!;
 
-    public decimal Quantity { get; set; }
+    public int Quantity { get; set; }
 }

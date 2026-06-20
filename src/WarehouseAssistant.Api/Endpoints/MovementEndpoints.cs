@@ -54,20 +54,21 @@ public static class MovementEndpoints
 
         app.MapDelete("/api/movements/{id:int}", async (
             int id,
-            WarehouseDbContext db,
+            MovementService service,
             CancellationToken cancellationToken) =>
         {
-            var movement = await db.Movements.FindAsync([id], cancellationToken);
-
-            if (movement is null)
+            try
             {
-                return Results.NotFound();
+                var deleted = await service.DeleteAsync(id, cancellationToken);
+
+                return deleted
+                    ? Results.NoContent()
+                    : Results.NotFound();
             }
-
-            db.Movements.Remove(movement);
-            await db.SaveChangesAsync(cancellationToken);
-
-            return Results.NoContent();
+            catch (ValidationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
 
         return app;

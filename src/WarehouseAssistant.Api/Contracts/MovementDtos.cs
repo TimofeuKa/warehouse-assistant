@@ -2,18 +2,18 @@ namespace WarehouseAssistant.Api.Contracts;
 
 public sealed record MovementItemRequest(
     int NomenclatureId,
-    decimal Quantity);
+    int Quantity);
 
 public sealed record CreateMovementRequest(
     DateTimeOffset? OccurredAt,
     int? FromWarehouseId,
     int? ToWarehouseId,
-    IReadOnlyList<MovementItemRequest> Items);
+    IReadOnlyList<MovementItemRequest>? Items);
 
 public sealed record MovementItemResponse(
     int NomenclatureId,
     string NomenclatureName,
-    decimal Quantity);
+    int Quantity);
 
 public sealed record MovementResponse(
     int Id,

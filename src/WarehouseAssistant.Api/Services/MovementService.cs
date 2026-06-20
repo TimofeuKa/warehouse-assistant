@@ -9,14 +9,14 @@ public sealed class MovementService(WarehouseDbContext db)
 {
     public async Task<Movement> CreateAsync(CreateMovementRequest request, CancellationToken cancellationToken = default)
     {
-        await ValidateAsync(request, cancellationToken);
+        var items = await ValidateAsync(request, cancellationToken);
 
         var movement = new Movement
         {
             OccurredAt = request.OccurredAt ?? DateTimeOffset.UtcNow,
             FromWarehouseId = request.FromWarehouseId,
             ToWarehouseId = request.ToWarehouseId,
-            Items = request.Items
+            Items = items
                 .Select(x => new MovementItem
                 {
                     NomenclatureId = x.NomenclatureId,
@@ -31,7 +31,56 @@ public sealed class MovementService(WarehouseDbContext db)
         return movement;
     }
 
-    private async Task ValidateAsync(CreateMovementRequest request, CancellationToken cancellationToken)
+    public async Task<bool> DeleteAsync(int id, CancellationToken cancellationToken = default)
+    {
+        var movement = await db.Movements
+            .Include(x => x.Items)
+            .SingleOrDefaultAsync(x => x.Id == id, cancellationToken);
+
+        if (movement is null)
+        {
+            return false;
+        }
+
+        if (movement.ToWarehouseId is not null)
+        {
+            var nomenclatureIds = movement.Items
+                .Select(x => x.NomenclatureId)
+                .ToArray();
+
+            var timeline = await LoadStockTimelineAsync(
+                movement.ToWarehouseId.Value,
+                nomenclatureIds,
+                excludedMovementId: movement.Id,
+                cancellationToken);
+
+            foreach (var item in movement.Items)
+            {
+                var firstNegativeAt = FindFirstNegativeMoment(
+                    timeline.Where(x => x.NomenclatureId == item.NomenclatureId));
+
+                if (firstNegativeAt is not null)
+                {
+                    var nomenclatureName = await GetNomenclatureNameAsync(
+                        item.NomenclatureId,
+                        cancellationToken);
+
+                    throw new ValidationException(
+                        $"Нельзя удалить движение: это приведет к отрицательному остатку " +
+                        $"номенклатуры '{nomenclatureName}' на {firstNegativeAt:dd.MM.yyyy HH:mm}.");
+                }
+            }
+        }
+
+        db.Movements.Remove(movement);
+        await db.SaveChangesAsync(cancellationToken);
+
+        return true;
+    }
+
+    private async Task<IReadOnlyList<MovementItemRequest>> ValidateAsync(
+        CreateMovementRequest request,
+        CancellationToken cancellationToken)
     {
         if (request.FromWarehouseId is null && request.ToWarehouseId is null)
         {
@@ -43,17 +92,19 @@ public sealed class MovementService(WarehouseDbContext db)
             throw new ValidationException("Склад отправления и склад получения не должны совпадать.");
         }
 
-        if (request.Items.Count == 0)
+        if (request.Items is null || request.Items.Count == 0)
         {
             throw new ValidationException("Добавьте хотя бы одну ТМЦ.");
         }
 
-        if (request.Items.Any(x => x.Quantity <= 0))
+        var items = request.Items;
+
+        if (items.Any(x => x.Quantity <= 0))
         {
             throw new ValidationException("Количество должно быть больше нуля.");
         }
 
-        var duplicateNomenclature = request.Items
+        var duplicateNomenclature = items
             .GroupBy(x => x.NomenclatureId)
             .Any(x => x.Count() > 1);
 
@@ -75,7 +126,7 @@ public sealed class MovementService(WarehouseDbContext db)
             throw new ValidationException("Один из складов не найден.");
         }
 
-        var nomenclatureIds = request.Items
+        var nomenclatureIds = items
             .Select(x => x.NomenclatureId)
             .Distinct()
             .ToArray();
@@ -93,9 +144,11 @@ public sealed class MovementService(WarehouseDbContext db)
             await EnsureEnoughStockAsync(
                 request.FromWarehouseId.Value,
                 request.OccurredAt ?? DateTimeOffset.UtcNow,
-                request.Items,
+                items,
                 cancellationToken);
         }
+
+        return items;
     }
 
     private async Task EnsureEnoughStockAsync(
@@ -109,48 +162,88 @@ public sealed class MovementService(WarehouseDbContext db)
             .Distinct()
             .ToArray();
 
-        var incomingRows = await db.MovementItems
-            .Where(x =>
-                x.Movement.ToWarehouseId == warehouseId &&
-                x.Movement.OccurredAt <= at &&
-                nomenclatureIds.Contains(x.NomenclatureId))
-            .GroupBy(x => x.NomenclatureId)
-            .Select(x => new
-            {
-                NomenclatureId = x.Key,
-                Quantity = x.Sum(i => i.Quantity)
-            })
-            .ToDictionaryAsync(x => x.NomenclatureId, x => x.Quantity, cancellationToken);
-
-        var outgoingRows = await db.MovementItems
-            .Where(x =>
-                x.Movement.FromWarehouseId == warehouseId &&
-                x.Movement.OccurredAt <= at &&
-                nomenclatureIds.Contains(x.NomenclatureId))
-            .GroupBy(x => x.NomenclatureId)
-            .Select(x => new
-            {
-                NomenclatureId = x.Key,
-                Quantity = x.Sum(i => i.Quantity)
-            })
-            .ToDictionaryAsync(x => x.NomenclatureId, x => x.Quantity, cancellationToken);
+        var timeline = await LoadStockTimelineAsync(
+            warehouseId,
+            nomenclatureIds,
+            excludedMovementId: null,
+            cancellationToken);
 
         foreach (var item in requestedItems)
         {
-            incomingRows.TryGetValue(item.NomenclatureId, out var received);
-            outgoingRows.TryGetValue(item.NomenclatureId, out var spent);
+            var itemTimeline = timeline
+                .Where(x => x.NomenclatureId == item.NomenclatureId)
+                .Append(new StockDelta(item.NomenclatureId, at, -item.Quantity));
 
-            var available = received - spent;
-            if (available < item.Quantity)
+            var firstNegativeAt = FindFirstNegativeMoment(itemTimeline);
+            if (firstNegativeAt is not null)
             {
-                var nomenclatureName = await db.Nomenclatures
-                    .Where(x => x.Id == item.NomenclatureId)
-                    .Select(x => x.Name)
-                    .SingleAsync(cancellationToken);
+                var nomenclatureName = await GetNomenclatureNameAsync(
+                    item.NomenclatureId,
+                    cancellationToken);
 
                 throw new ValidationException(
-                    $"Недостаточно остатка для номенклатуры '{nomenclatureName}'. Доступно: {available}, требуется: {item.Quantity}.");
+                    $"Недостаточно остатка для номенклатуры '{nomenclatureName}'. " +
+                    $"Операция приведет к отрицательному остатку на {firstNegativeAt:dd.MM.yyyy HH:mm}.");
             }
         }
     }
+
+    private async Task<List<StockDelta>> LoadStockTimelineAsync(
+        int warehouseId,
+        IReadOnlyCollection<int> nomenclatureIds,
+        int? excludedMovementId,
+        CancellationToken cancellationToken)
+    {
+        var query = db.MovementItems
+            .Where(x =>
+                nomenclatureIds.Contains(x.NomenclatureId) &&
+                (x.Movement.ToWarehouseId == warehouseId ||
+                 x.Movement.FromWarehouseId == warehouseId));
+
+        if (excludedMovementId is not null)
+        {
+            query = query.Where(x => x.MovementId != excludedMovementId.Value);
+        }
+
+        return await query
+            .Select(x => new StockDelta(
+                x.NomenclatureId,
+                x.Movement.OccurredAt,
+                x.Movement.ToWarehouseId == warehouseId ? x.Quantity : -x.Quantity))
+            .ToListAsync(cancellationToken);
+    }
+
+    private async Task<string> GetNomenclatureNameAsync(
+        int nomenclatureId,
+        CancellationToken cancellationToken)
+    {
+        return await db.Nomenclatures
+            .Where(x => x.Id == nomenclatureId)
+            .Select(x => x.Name)
+            .SingleAsync(cancellationToken);
+    }
+
+    private static DateTimeOffset? FindFirstNegativeMoment(IEnumerable<StockDelta> timeline)
+    {
+        var balance = 0;
+
+        foreach (var moment in timeline
+                     .GroupBy(x => x.OccurredAt)
+                     .OrderBy(x => x.Key))
+        {
+            balance += moment.Sum(x => x.Quantity);
+
+            if (balance < 0)
+            {
+                return moment.Key;
+            }
+        }
+
+        return null;
+    }
+
+    private sealed record StockDelta(
+        int NomenclatureId,
+        DateTimeOffset OccurredAt,
+        int Quantity);
 }

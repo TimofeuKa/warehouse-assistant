@@ -105,6 +105,38 @@ public sealed class StockServiceTests
     }
 
     [Fact]
+    public async Task CreateAsync_RejectsNullItems()
+    {
+        await using var db = CreateDbContext();
+        var movementService = new MovementService(db);
+
+        var exception = await Assert.ThrowsAsync<ValidationException>(() =>
+            movementService.CreateAsync(new CreateMovementRequest(
+                DateTimeOffset.UtcNow,
+                FromWarehouseId: null,
+                ToWarehouseId: 1,
+                Items: null)));
+
+        Assert.Equal("Добавьте хотя бы одну ТМЦ.", exception.Message);
+    }
+
+    [Fact]
+    public async Task CreateAsync_RejectsEmptyItems()
+    {
+        await using var db = CreateDbContext();
+        var movementService = new MovementService(db);
+
+        var exception = await Assert.ThrowsAsync<ValidationException>(() =>
+            movementService.CreateAsync(new CreateMovementRequest(
+                DateTimeOffset.UtcNow,
+                FromWarehouseId: null,
+                ToWarehouseId: 1,
+                Items: [])));
+
+        Assert.Equal("Добавьте хотя бы одну ТМЦ.", exception.Message);
+    }
+
+    [Fact]
     public async Task CreateAsync_RejectsSameSourceAndDestinationWarehouse()
     {
         await using var db = CreateDbContext();
@@ -141,6 +173,88 @@ public sealed class StockServiceTests
                 [new MovementItemRequest(1, 6)])));
 
         Assert.Contains("Недостаточно остатка", exception.Message);
+    }
+
+    [Fact]
+    public async Task CreateAsync_RejectsBackdatedExpenseThatMakesFutureStockNegative()
+    {
+        await using var db = CreateDbContext();
+        var movementService = new MovementService(db);
+        var startedAt = new DateTimeOffset(2026, 6, 19, 9, 0, 0, TimeSpan.Zero);
+
+        await movementService.CreateAsync(new CreateMovementRequest(
+            startedAt,
+            FromWarehouseId: null,
+            ToWarehouseId: 1,
+            [new MovementItemRequest(1, 10)]));
+
+        await movementService.CreateAsync(new CreateMovementRequest(
+            startedAt.AddHours(2),
+            FromWarehouseId: 1,
+            ToWarehouseId: null,
+            [new MovementItemRequest(1, 10)]));
+
+        var exception = await Assert.ThrowsAsync<ValidationException>(() =>
+            movementService.CreateAsync(new CreateMovementRequest(
+                startedAt.AddHours(1),
+                FromWarehouseId: 1,
+                ToWarehouseId: null,
+                [new MovementItemRequest(1, 1)])));
+
+        Assert.Contains("отрицательному остатку", exception.Message);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_RejectsDeletingIncomeUsedByLaterExpense()
+    {
+        await using var db = CreateDbContext();
+        var movementService = new MovementService(db);
+        var startedAt = new DateTimeOffset(2026, 6, 19, 9, 0, 0, TimeSpan.Zero);
+
+        var income = await movementService.CreateAsync(new CreateMovementRequest(
+            startedAt,
+            FromWarehouseId: null,
+            ToWarehouseId: 1,
+            [new MovementItemRequest(1, 5)]));
+
+        await movementService.CreateAsync(new CreateMovementRequest(
+            startedAt.AddMinutes(5),
+            FromWarehouseId: 1,
+            ToWarehouseId: null,
+            [new MovementItemRequest(1, 5)]));
+
+        var exception = await Assert.ThrowsAsync<ValidationException>(() =>
+            movementService.DeleteAsync(income.Id));
+
+        Assert.Contains("Нельзя удалить движение", exception.Message);
+        Assert.NotNull(await db.Movements.FindAsync(income.Id));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_AllowsDeletingExpense()
+    {
+        await using var db = CreateDbContext();
+        var movementService = new MovementService(db);
+        var stockService = new StockService(db);
+        var startedAt = new DateTimeOffset(2026, 6, 19, 9, 0, 0, TimeSpan.Zero);
+
+        await movementService.CreateAsync(new CreateMovementRequest(
+            startedAt,
+            FromWarehouseId: null,
+            ToWarehouseId: 1,
+            [new MovementItemRequest(1, 5)]));
+
+        var expense = await movementService.CreateAsync(new CreateMovementRequest(
+            startedAt.AddMinutes(5),
+            FromWarehouseId: 1,
+            ToWarehouseId: null,
+            [new MovementItemRequest(1, 3)]));
+
+        var deleted = await movementService.DeleteAsync(expense.Id);
+        var stock = await stockService.GetStockAsync(1, startedAt.AddMinutes(10));
+
+        Assert.True(deleted);
+        Assert.Equal(5, stock.Single(x => x.NomenclatureId == 1).Quantity);
     }
 
     private static WarehouseDbContext CreateDbContext()

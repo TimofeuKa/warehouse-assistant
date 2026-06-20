@@ -59,7 +59,7 @@ public sealed class WarehouseDbContext(DbContextOptions<WarehouseDbContext> opti
 
         modelBuilder.Entity<MovementItem>(entity =>
         {
-            entity.Property(x => x.Quantity).HasPrecision(18, 3).IsRequired();
+            entity.Property(x => x.Quantity).IsRequired();
 
             entity.HasIndex(x => new { x.MovementId, x.NomenclatureId }).IsUnique();
         });
