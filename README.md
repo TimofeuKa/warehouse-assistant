@@ -73,3 +73,86 @@
 - Пагинацию, фильтрацию и поиск в журнале движений.
 - Экспорт отчета по остаткам в Excel или CSV.
 - Конкурентную обработку одновременных складских операций.
+
+## Запуск приложения
+
+### 1. Клонирование репозитория
+
+```powershell
+git clone https://github.com/TimofeuKa/warehouse-assistant.git
+cd warehouse-assistant
+```
+
+### 2. Запуск PostgreSQL
+
+Запустите Docker Desktop и дождитесь состояния `Engine running`.
+
+В корневой папке проекта выполните:
+
+```powershell
+docker compose -p warehouse_assistant up -d
+docker ps
+```
+
+Контейнер `warehouse-assistant-postgres` должен перейти в состояние `healthy`.
+
+PostgreSQL будет доступен на порту `55432`.
+
+### 3. Применение миграций
+
+```powershell
+dotnet tool restore
+dotnet ef database update --project src\WarehouseAssistant.Api --startup-project src\WarehouseAssistant.Api
+```
+
+Команда создаст структуру базы данных и добавит начальные справочники складов и номенклатур.
+
+### 4. Запуск backend
+
+```powershell
+dotnet run --project src\WarehouseAssistant.Api
+```
+
+Backend будет доступен по адресу:
+
+```text
+http://localhost:5052
+```
+
+Документация API:
+
+```text
+http://localhost:5052/scalar/v1
+```
+
+OpenAPI JSON:
+
+```text
+http://localhost:5052/openapi/v1.json
+```
+
+Не закрывайте этот терминал во время работы приложения.
+
+### 5. Запуск frontend
+
+Откройте второй терминал:
+
+```powershell
+cd warehouse-assistant\frontend
+npm ci
+npm run dev
+```
+
+Frontend будет доступен по адресу:
+
+```text
+http://localhost:5173
+```
+
+## Запуск тестов
+
+Из корневой папки проекта:
+
+```powershell
+dotnet test
+```
